@@ -1,0 +1,60 @@
+plugins {
+    id 'java'
+    id 'net.neoforged.moddev' version '2.0.148'
+}
+
+// 产物名：aiadmin-neoforge-1.21.1-<版本>.jar
+base { archivesName = 'aiadmin-neoforge-1.21.1' }
+
+java { toolchain { languageVersion = JavaLanguageVersion.of(21) } }
+// 和 core 一样告警即失败；-classfile：log4j 的类文件里缺注解方法的提示来自依赖本身，不是本模组代码
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.compilerArgs += ['-Xlint:all,-processing,-serial,-classfile', '-Werror']
+}
+
+neoForge {
+    // 按服务器实际用的 NeoForge 21.1.235 编译；同一 jar 也能在之后的 21.1.x 上用。
+    version = '21.1.235'
+    runs {
+        // 端到端测试：开发服务端（离线模式）+ scripts/mock_llm.py 假模型服务，见 scripts/e2e*.py。
+        server {
+            server()
+            gameDirectory = project.file('run/server')
+            programArgument '--nogui'
+            systemProperty 'aiadmin.devConsoleCommands', System.getProperty('aiadmin.devConsoleCommands', '')
+            systemProperty 'aiadmin.devConsoleCommandsFile', System.getProperty('aiadmin.devConsoleCommandsFile', '')
+            systemProperty 'aiadmin.devStopAfterRuns', System.getProperty('aiadmin.devStopAfterRuns', '0')
+            systemProperty 'aiadmin.devHaltAfterSeconds', System.getProperty('aiadmin.devHaltAfterSeconds', '0')
+            systemProperty 'aiadmin.devFakePlayer', System.getProperty('aiadmin.devFakePlayer', 'false')
+            systemProperty 'aiadmin.devTpaTest', System.getProperty('aiadmin.devTpaTest', 'false')
+            systemProperty 'aiadmin.devGoalTest', System.getProperty('aiadmin.devGoalTest', 'false')
+            systemProperty 'aiadmin.devChatFile', System.getProperty('aiadmin.devChatFile', '')
+            systemProperty 'aiadmin.devWebhookInsecure', System.getProperty('aiadmin.devWebhookInsecure', 'false')
+            systemProperty 'aiadmin.devSocialTest', System.getProperty('aiadmin.devSocialTest', 'false')
+        }
+    }
+    mods {
+        aiadmin {
+            sourceSet sourceSets.main
+            sourceSet project(':core').sourceSets.main
+        }
+    }
+}
+
+repositories { mavenCentral() }
+
+dependencies {
+    implementation project(':core')
+}
+
+// 核心直接打进模组 jar（包名唯一，不需要改名）。
+jar {
+    from(project(':core').sourceSets.main.output)
+    manifest { attributes('Implementation-Version': project.version) }
+}
+
+processResources {
+    inputs.property 'version', project.version
+    filesMatching('META-INF/neoforge.mods.toml') { expand(version: project.version) }
+}

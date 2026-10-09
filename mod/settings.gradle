@@ -1,0 +1,13 @@
+// MC AI 管理机器人模组：core = 纯 Java 核心（与 MC 无关，可单测）；neoforge-1.21.1 = NeoForge 适配层。
+pluginManagement {
+    repositories {
+        gradlePluginPortal()
+        maven { url = 'https://maven.neoforged.net/releases' }
+    }
+}
+plugins {
+    id 'org.gradle.toolchains.foojay-resolver-convention' version '0.10.0'
+}
+rootProject.name = 'aiadmin-mod'
+include 'core'
+include 'neoforge-1.21.1'

@@ -1,0 +1,6 @@
+// 版本唯一来源是仓库根的 version.json，这里直接读它。
+def repoVersion = new groovy.json.JsonSlurper().parse(rootProject.file('../version.json')).version
+allprojects {
+    group = 'io.github.aftsakee.aiadmin'
+    version = repoVersion
+}

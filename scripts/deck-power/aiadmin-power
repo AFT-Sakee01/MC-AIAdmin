@@ -1,0 +1,252 @@
+#!/bin/bash
+# 给 aiadmin 模组（MC 服务端进程，crafty 用户）用的启停入口：云端 AI 通过模组的 server_power 工具调到这里。
+#   sudo -n /usr/local/sbin/aiadmin-power check      只检查能不能启停，不执行
+#   sudo -n /usr/local/sbin/aiadmin-power restart    重启当前运行的 MC 服务器
+#   sudo -n /usr/local/sbin/aiadmin-power stop       停掉当前运行的 MC 服务器（不会自动再开；要开得服主手动）
+#   sudo -n /usr/local/sbin/aiadmin-power backup     不停服备份一次（Crafty 的"AI 手动备份"配置：只留 2 份，不挤掉定时备份）
+#   sudo -n /usr/local/sbin/aiadmin-power status     看启停/备份记录和现有备份（只读）
+#   sudo -n /usr/local/sbin/aiadmin-power host       主机负载、内存、磁盘、温度、各服务状态（只读）
+#   sudo -n /usr/local/sbin/aiadmin-power logs <来源> [行数]   看日志（只读，密钥/密码脱敏）
+#   sudo -n /usr/local/sbin/aiadmin-power actions    机器可读的动作清单（模组据此决定哪些走只读入口、哪些要写理由）
+# 模组只转发动作名和参数，能做什么完全由这里决定：以后加动作只改本文件和 actions 清单，不用改模组。
+# sudoers 放行本程序的任意参数，所以每个参数都在下面统一校验（字符集、长度、个数），__run 只接受 root 直接调用。
+# 安全边界（这里以 root 运行，sudoers 放行本程序的任意参数，所以这里是唯一的把关处）：
+#   - 只碰"当前正在运行的那个"服务器，不切换、不带 -f；
+#   - 自己用 RCON list 数在线玩家（不信任调用方，也不用 ss 连接数：frpc 会挂着空闲连接，连接数≠玩家数），
+#     有人在线或数不出来（RCON 不通）一律拒绝；
+#   - 限频：60 分钟内最多 3 次，两次之间至少 5 分钟（记录在 /var/lib/aiadmin-power/history，重启不丢，
+#     防止 AI 循环重启）；
+#   - 避开 Crafty 定时备份（10:00、22:00）前后 5~15 分钟，停 Crafty 会打断正在打的 zip；
+#   - 真正的停/启放到 systemd-run 起的独立单元里做，等 8 秒再动手：调用方是 MC 进程自己，
+#     它必须先把"已安排"回给云端，而且子进程不能挂在要被停掉的 java 进程树下；
+#   - 动手前再数一次玩家，这几秒里有人进来就放弃；与 cloudai-helper 共用 /run/cloudai-mc.lock 串行。
+# 备份的边界：有人在线也可以（Crafty 不停服备份）；2 小时最多 1 次；正在打 zip（备份目录 90 秒内有文件在变）时拒绝；
+#   剩余空间要够"服务器目录×1.2 + 16 GiB"（和 backup-space-guard 同一条线）；手动备份配置 ID 记在 $STATE/manual-backup-<服务器ID>。
+# 日志：/var/log/aiadmin-power.log（root 640）+ syslog（aiadmin-power）。
+set -euo pipefail
+export LC_ALL=C.UTF-8
+
+SERVERS=/srv/steamdeck-shared/minecraft-shared/servers
+MCADMIN_HOME=/home/mcadmin
+LOG=/var/log/aiadmin-power.log
+STATE=/var/lib/aiadmin-power
+HIST=$STATE/history
+LOCK=/run/cloudai-mc.lock
+MAX_PER_HOUR=3
+MIN_GAP=300
+BACKUPS=/srv/steamdeck-shared/minecraft-shared/backups
+BACKUP_GAP=7200
+
+[ "$(id -u)" = 0 ] || { echo "拒绝：需要 root"; exit 1; }
+# 参数统一校验：sudoers 放行任意参数，这里是唯一把关（__run 由 systemd-run 以 root 直接调用，参数是本程序自己拼的）
+if [ "${1:-}" != "__run" ]; then
+    [ "$#" -le 4 ] || { echo "拒绝：参数太多"; exit 2; }
+    for a in "$@"; do
+        [[ "$a" =~ ^[A-Za-z0-9_.:-]{1,40}$ ]] || { echo "拒绝：参数含不允许的字符"; exit 2; }
+    done
+fi
+. /usr/local/lib/mc-crafty.sh
+
+# 日志脱敏：API key、密码类配置值（玩家 IP 服主允许看，不打码）
+redact() {
+    sed -E \
+        -e 's/sk-[A-Za-z0-9_-]{8,}/[已隐藏]/g' \
+        -e 's/((password|passwd|secret|token|api[_-]?key)["]?[[:space:]]*[=:][[:space:]]*)[^[:space:],}]+/\1[已隐藏]/Ig'
+}
+
+audit() {
+    printf '%s caller=%s %s\n' "$(date '+%F %T')" "${SUDO_USER:-root}" "$*" >> "$LOG" 2>/dev/null || true
+    logger -t aiadmin-power "$*" 2>/dev/null || true
+}
+
+# 在线玩家数：读运行中服务器自己的 server.properties 走 RCON；打印数字，失败返回非 0（调用方按"拒绝"处理）。
+players_online() {
+    local sid="$1"
+    python3 - "$SERVERS/$sid/server.properties" <<'PY'
+import re, socket, struct, sys
+props = {}
+for l in open(sys.argv[1], encoding="utf-8").read().splitlines():
+    if "=" in l and not l.startswith("#"):
+        k, v = l.split("=", 1); props[k] = v
+if props.get("enable-rcon") != "true": sys.exit(2)
+s = socket.create_connection(("127.0.0.1", int(props.get("rcon.port", "25575"))), 5); s.settimeout(10)
+def pkt(i, t, body):
+    b = struct.pack("<ii", i, t) + body.encode("utf-8") + b"\x00\x00"
+    s.sendall(struct.pack("<i", len(b)) + b)
+def rd():
+    n = struct.unpack("<i", s.recv(4))[0]; d = b""
+    while len(d) < n: d += s.recv(n - len(d))
+    i, t = struct.unpack("<ii", d[:8]); return i, d[8:-2].decode("utf-8", "replace")
+pkt(1, 3, props["rcon.password"])
+if rd()[0] == -1: sys.exit(3)
+pkt(2, 2, "list")
+m = re.search(r"There are (\d+) of", rd()[1])
+if not m: sys.exit(4)
+print(m.group(1))
+PY
+}
+
+# 备份窗口：09:55-10:15、21:55-22:15 不动（Crafty 备份 10:00/22:00，TCN2 打 zip 要几分钟）。
+in_backup_window() {
+    local hm; hm=$((10#$(date +%H) * 60 + 10#$(date +%M)))
+    for t in 600 1320; do
+        if [ "$hm" -ge $((t - 5)) ] && [ "$hm" -lt $((t + 15)) ]; then return 0; fi
+    done
+    return 1
+}
+
+# 备份目录 90 秒内有文件在变 = 可能正在打 zip。
+backup_writing() {
+    [ -n "$(find "$BACKUPS/$1" -type f -newermt '-90 seconds' 2>/dev/null | head -1)" ]
+}
+
+# 手动备份开始后多久内不许重启/停服（秒）。
+BACKUP_SETTLE=600
+
+# 所有检查；通过时把运行中的服务器 ID 写到 stdout，否则打印原因到 stdout 并返回 3。
+precheck() {
+    local sid n now recent last
+    sid=$(mc_running_sid 2>/dev/null || true)
+    [ -n "$sid" ] || { echo "拒绝：现在没有 MC 服务器在运行"; return 3; }
+    if in_backup_window; then echo "拒绝：正在定时备份时段（10:00、22:00 前 5 分钟到后 15 分钟），稍后再试"; return 3; fi
+    now=$(date +%s)
+    recent=$(awk -v t=$((now - 3600)) '$1 >= t' "$HIST" 2>/dev/null | wc -l)
+    last=$(tail -n 1 "$HIST" 2>/dev/null | awk '{print $1}' || true); last=${last:-0}
+    if [ "$recent" -ge "$MAX_PER_HOUR" ]; then echo "拒绝：60 分钟内已经启停 $recent 次（上限 $MAX_PER_HOUR），请服主手动处理"; return 3; fi
+    if [ $((now - last)) -lt "$MIN_GAP" ]; then echo "拒绝：距上次启停不到 $((MIN_GAP / 60)) 分钟"; return 3; fi
+    if ! n=$(players_online "$sid" 2>/dev/null); then echo "拒绝：数不出在线人数（RCON 不通），为安全起见不启停"; return 3; fi
+    if [ "$n" -gt 0 ]; then echo "拒绝：有 $n 个玩家在线，不能启停"; return 3; fi
+    # 手动备份只在调 Crafty API 的几秒里持锁，真正打 zip 是异步的 1~3 分钟：停服会把它打断
+    lastb=$(tail -n 1 "$STATE/backup-history" 2>/dev/null | awk '{print $1}' || true); lastb=${lastb:-0}
+    if [ $((now - lastb)) -lt "$BACKUP_SETTLE" ]; then echo "拒绝：$(( (now - lastb) / 60 )) 分钟前刚开始过手动备份（可能还在打包），稍后再试"; return 3; fi
+    if backup_writing "$sid"; then echo "拒绝：备份目录里有文件正在写（可能正在备份），稍后再试"; return 3; fi
+    echo "$sid"
+}
+
+backup_status() {
+    local sid="$1" bid f
+    echo "定时备份（10:00、22:00，留 3 份）："
+    # || true：备份目录还不存在时 find 返回 1，set -o pipefail + errexit 会让整个 status 打完标题就退出
+    { find "$BACKUPS/$sid" -name '*.zip' -printf '%TY-%Tm-%Td %TH:%TM  %s  %h\n' 2>/dev/null | sort | while read -r d t size dir; do
+        bid=$(basename "$dir"); f=$(cat "$STATE/manual-backup-$sid" 2>/dev/null || true)
+        [ "$bid" = "$f" ] && continue
+        echo "  $d $t  $((size / 1048576)) MB"
+    done; } || true
+    f=$(cat "$STATE/manual-backup-$sid" 2>/dev/null || true)
+    echo "AI 手动备份（留 2 份）："
+    if [ -n "$f" ]; then
+        { find "$BACKUPS/$sid/$f" -name '*.zip' -printf '%TY-%Tm-%Td %TH:%TM  %s\n' 2>/dev/null | sort | awk '{printf "  %s %s  %d MB\n", $1, $2, $3/1048576}'; } || true
+    else echo "  （这个服务器没有配置）"; fi
+}
+
+action="${1:-}"
+case "$action" in
+actions)
+    # 格式：名字<TAB>read|action<TAB>参数<TAB>说明。read = 只读，action = 会改动（模组要求写 reason）
+    printf '%s\t%s\t%s\t%s\n' \
+        status read "" "当前运行的 MC 服务器、现有备份、最近的启停/备份记录" \
+        check read "" "检查现在能不能重启/停服（人数、限频、备份时段）" \
+        host read "" "主机负载、内存、磁盘、温度、各服务状态、MC/Terraria 连接数" \
+        logs read "<mc|aiadmin|crafty|frp|terraria|system> [行数≤200]" "看日志（密钥、密码已脱敏）" \
+        backup action "" "不停服备份一次（有人在线也可以；2 小时 1 次；单独留 2 份）" \
+        restart action "" "重启当前 MC 服务器（没人在线才行；60 分钟 3 次）" \
+        stop action "" "停掉当前 MC 服务器（没人在线才行；停服后远程接口也关，只有服主能再开）"
+    ;;
+host)
+    echo "== 主机 =="; echo "$(hostname)  $(uptime -p)  load: $(cut -d' ' -f1-3 /proc/loadavg)"
+    free -m | awk 'NR==1||/Mem|Swap/'
+    df -h / /srv/steamdeck-shared 2>/dev/null | awk 'NR==1||/\//'
+    { for z in /sys/class/thermal/thermal_zone*/temp; do if [ -r "$z" ]; then echo "温度 $(cat "$(dirname "$z")/type" 2>/dev/null): $(( $(cat "$z") / 1000 ))°C"; fi; done; } 2>/dev/null | head -4 || true
+    echo "== 服务 =="
+    for u in crafty natfrp dupx-terraria terraria tailscaled ssh mc-idle-gen; do printf '  %-16s %s\n' "$u" "$(systemctl is-active "$u" 2>/dev/null || true)"; done
+    sid=$(mc_running_sid 2>/dev/null || true)
+    echo "== 游戏 =="
+    echo "  MC 运行中：$([ -n "$sid" ] && mc_server_name "$sid" || echo 无)"
+    if [ -n "$sid" ] && n=$(players_online "$sid" 2>/dev/null); then echo "  MC 在线玩家：$n"; fi
+    echo "  Terraria 7777/7778 已建立连接：$(ss -tnH state established '( sport = :7777 or sport = :7778 )' 2>/dev/null | wc -l)"
+    ;;
+logs)
+    which="${2:-}"; n="${3:-80}"
+    [[ "$n" =~ ^[0-9]{1,3}$ ]] || { echo "行数要是数字"; exit 2; }
+    [ "$n" -gt 200 ] && n=200; [ "$n" -lt 1 ] && n=1
+    sid=$(mc_running_sid 2>/dev/null || true)
+    case "$which" in
+        mc|aiadmin)
+            [ -n "$sid" ] || { echo "现在没有 MC 服务器在运行"; exit 0; }
+            f="$SERVERS/$sid/logs/latest.log"; [ "$which" = aiadmin ] && f="$SERVERS/$sid/logs/aiadmin/full.jsonl"
+            tail -n "$n" "$f" ;;
+        crafty|terraria) journalctl -u "$which" -n "$n" --no-pager ;;
+        frp) journalctl -u natfrp -n "$n" --no-pager ;;
+        system) journalctl -p warning -n "$n" --no-pager ;;
+        *) echo "用法：logs <mc|aiadmin|crafty|frp|terraria|system> [行数≤200]"; exit 2 ;;
+    esac 2>&1 | cut -c1-600 | redact
+    ;;
+status)
+    sid=$(mc_running_sid 2>/dev/null || true)
+    [ -n "$sid" ] || { echo "现在没有 MC 服务器在运行"; exit 0; }
+    echo "运行中：$(mc_server_name "$sid")"
+    backup_status "$sid"
+    echo "最近的启停/备份记录："
+    tail -n 5 "$HIST" "$STATE/backup-history" 2>/dev/null | grep -v '^==' | grep . | sort | while read -r ts act _; do echo "  $(date -d "@$ts" '+%m-%d %H:%M') $act"; done || true
+    ;;
+backup)
+    exec 9>"$LOCK"
+    flock -n 9 || { echo "拒绝：另一个启停操作正在进行"; audit "refused backup (busy)"; exit 4; }
+    sid=$(mc_running_sid 2>/dev/null || true)
+    [ -n "$sid" ] || { echo "拒绝：现在没有 MC 服务器在运行"; exit 3; }
+    bid=$(cat "$STATE/manual-backup-$sid" 2>/dev/null || true)
+    [ -n "$bid" ] || { echo "拒绝：这个服务器没有配置 AI 手动备份，请服主处理"; exit 3; }
+    if in_backup_window; then echo "拒绝：正在定时备份时段（10:00、22:00 前 5 分钟到后 15 分钟），稍后再试"; exit 3; fi
+    now=$(date +%s); last=$(tail -n 1 "$STATE/backup-history" 2>/dev/null | awk '{print $1}' || true); last=${last:-0}
+    if [ $((now - last)) -lt "$BACKUP_GAP" ]; then echo "拒绝：上次手动备份在 $(( (now - last) / 60 )) 分钟前，2 小时内只能备份一次"; audit "refused backup (gap)"; exit 3; fi
+    if backup_writing "$sid"; then echo "拒绝：备份目录里有文件正在写（可能正在备份），稍后再试"; exit 3; fi
+    # du 扫描时服务端正在写的文件可能消失，du 返回 1：单独取值、校验是数字，不能让 set -e 在这里静默退出
+    size=$(du -sb "$SERVERS/$sid" 2>/dev/null | cut -f1) || true
+    [[ "$size" =~ ^[0-9]+$ ]] || { echo "拒绝：算不出服务器目录大小，稍后再试"; audit "refused backup (du)"; exit 3; }
+    need=$(( size * 12 / 10 + 16 * 1073741824 ))
+    free=$(( $(stat -f -c '%a * %S' "$BACKUPS") ))
+    if [ "$free" -lt "$need" ]; then echo "拒绝：剩余空间不够（剩 $((free / 1073741824)) GiB，需要 $((need / 1073741824)) GiB）"; audit "refused backup (space)"; exit 3; fi
+    if ! out=$(python3 /usr/local/lib/aiadmin-crafty-backup.py start "$sid" "$bid" 2>&1); then
+        echo "备份没有开始：$(echo "$out" | tail -n 1 | cut -c1-200)"; audit "backup failed: $(echo "$out" | tail -n 1 | cut -c1-200)"; exit 1
+    fi
+    install -d -m 750 "$STATE"; echo "$now backup $sid" >> "$STATE/backup-history"
+    audit "backup started $sid ($bid)"
+    echo "已开始：$(mc_server_name "$sid") 不停服备份，大约 1~3 分钟，期间可能有一点卡顿。存在 AI 手动备份里（只留最近 2 份，不影响每天 10:00/22:00 的定时备份）"
+    ;;
+check|restart|stop)
+    exec 9>"$LOCK"
+    flock -n 9 || { echo "拒绝：另一个启停操作正在进行"; audit "refused $action (busy)"; exit 4; }
+    if ! out=$(precheck); then echo "$out"; audit "refused $action: $out"; exit 3; fi
+    sid="$out"; name=$(mc_server_name "$sid")
+    if [ "$action" = check ]; then echo "检查通过：$name 在运行、没人在线，可以重启或停服"; exit 0; fi
+    install -d -m 750 "$STATE"; echo "$(date +%s) $action $sid" >> "$HIST"
+    audit "scheduled $action $sid ($name)"
+    flock -u 9
+    systemd-run --quiet --collect --unit="aiadmin-power-$(date +%s)" \
+        --description="aiadmin power $action" /usr/local/sbin/aiadmin-power __run "$action" "$sid"
+    if [ "$action" = restart ]; then echo "已安排：约 10 秒后重启 $name。停服存档+重新开服大约 2~4 分钟，期间远程连接会断开，之后重连即可"
+    else echo "已安排：约 10 秒后停掉 $name。停服后远程接口也会关闭，需要服主手动开服"; fi
+    ;;
+__run)
+    # 只由上面的 systemd-run 调用（sudoers 不放行这个参数）：真正执行停/启。
+    [ -z "${SUDO_USER:-}" ] || { echo "拒绝"; exit 1; }
+    act="${2:-}"; sid="${3:-}"
+    [[ "$sid" =~ ^[0-9a-f-]{36}$ ]] || exit 2
+    sleep 8
+    exec 9>"$LOCK"; flock -w 60 9 || { audit "abort $act: lock busy"; exit 4; }
+    if [ "$(mc_running_sid 2>/dev/null || true)" != "$sid" ]; then audit "abort $act: running server changed"; exit 3; fi
+    n=$(players_online "$sid" 2>/dev/null) || n=unknown
+    if [ "$n" != 0 ]; then audit "abort $act: players=$n"; exit 3; fi
+    if backup_writing "$sid"; then audit "abort $act: backup in progress"; exit 3; fi
+    audit "run $act $sid stop phase"
+    bash "$MCADMIN_HOME/mc-stop-noautostart.sh" >> "$LOG" 2>&1 || { audit "stop failed"; exit 1; }
+    if [ "$act" = restart ]; then
+        audit "run restart start phase"
+        bash "$MCADMIN_HOME/mc-start.sh" "$sid" >> "$LOG" 2>&1 && audit "restart done" || audit "start failed"
+    else
+        audit "stop done"
+    fi
+    ;;
+*)
+    echo "不认识的动作：$action（可用动作见 actions）"; exit 2 ;;
+esac

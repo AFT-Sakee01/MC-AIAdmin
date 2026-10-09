@@ -1,0 +1,5 @@
+# /etc/sudoers.d/aiadmin-power —— MC 服务端进程（crafty）只能以 root 执行宿主机动作入口这一个程序。
+# 参数放开（加动作不用改这里），由 /usr/local/sbin/aiadmin-power 统一校验字符集、长度、个数和动作名；
+# 内部的 __run 只接受 root 直接调用（经 sudo 时 SUDO_USER 非空，会被拒）。
+Defaults:crafty !requiretty, env_reset
+crafty ALL=(root) NOPASSWD: /usr/local/sbin/aiadmin-power, /usr/local/sbin/aiadmin-power *

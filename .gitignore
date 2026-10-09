@@ -1,0 +1,13 @@
+# Gradle（MC 模组）
+mod/**/.gradle/
+mod/.gradle/
+mod/**/build/
+mod/build/
+mod/**/run/
+# 发布产物
+/dist/
+# 程序运行日志、排重状态、本地密钥
+logs/
+error-dedup-state.json
+__pycache__/
+.DS_Store
