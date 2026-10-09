@@ -2,6 +2,11 @@
 
 适用版本：1.0.0.39　Minecraft 1.21.1 + NeoForge 21.1.x（按 21.1.235 编译）　只需装在服务端，玩家不用装。
 
+> **本项目完全由 AI 开发**：代码、测试、脚本和文档全部由 AI 模型（Anthropic Claude）编写，人类负责提出需求、做决定和验收。
+> 以 [MIT 许可证](LICENSE) 发布，使用前请先读文末的[免责声明](#免责声明)。
+>
+> *This project was developed entirely by AI (code, tests, scripts and docs). Released under the MIT License; see the disclaimer at the end.*
+
 服务端 AI 管理员：接入 **GPT / Claude / DeepSeek / Antigravity**（官方 API 或中转站），能**看到服务器的一切信息**，但**只能通过后台指令和发送聊天**影响服务器。
 
 - 唤醒方式：定时巡检、事件（进服、死亡、卡顿、报错…）、玩家聊天（叫它名字或 @它；也可以按自定义条件或所有聊天唤醒，按群体/个人设上限和授权）、管理员 `/aibot ask`。
@@ -727,3 +732,18 @@ python scripts/live_deepseek.py <存放密钥的文件>
 - 单价是估算用的参考值，请按各家官网当前价格核对；DeepSeek 的真实余额以余额接口为准。
 - 只支持在线玩家的详细信息；离线玩家的存档数据不解析。
 - 游戏资料：原版物品服务端没有中文名；掉落不含全局战利品修改器、代码写死的掉落和村民交易；合成链路每个物品只选一条配方，不保证是最省的做法；数据组件只解析药水内容（附魔、烟花等不解析），背包按物品 ID 汇总，带药水的原料不会从背包里扣；模组新增的药水瓶容器枚举不到它的酿造配方。
+
+## 许可证
+
+[MIT](LICENSE)。
+
+## 免责声明
+
+- **完全由 AI 开发**：本项目的代码、测试和文档都由 AI 生成，虽然有单元测试和端到端测试，但没有经过人工逐行审查，可能存在缺陷或安全问题。部署前请自行评估。
+- **AI 会真的动你的服务器**：机器人能以控制台身份执行指令、给玩家发消息；黑名单、额度、启停限制只能降低风险，不能保证模型不犯错（误判、被玩家的话诱导、执行出乎意料的指令）。请先在测试服试用，保留好存档备份，并按需要收紧 `rules.json`。
+- **费用自负**：调用 OpenAI、Anthropic、DeepSeek、Google 等接口会按各家价格计费；模组里的单价和花费只是估算，请以服务商账单为准，并设置好额度上限。
+- **隐私与合规**：机器人会读服务器日志、玩家聊天和行为记录，并把其中一部分发给你配置的 AI 服务商；远程管理接口如果暴露到公网，安全取决于你的令牌和网络设置。请告知玩家、遵守所在地的隐私法规，以及 Minecraft EULA 和各 AI 服务商的使用条款。
+- **非官方**：本项目与 Mojang、Microsoft、NeoForged、OpenAI、Anthropic、DeepSeek、Google、Tailscale 等没有任何关联，也未获得它们的认可；相关名称和商标归各自所有者。
+- 软件按"原样"提供，不附带任何形式的担保；作者不对使用本软件造成的任何损失（包括存档损坏、服务器故障、费用或数据泄露）负责，详见 [LICENSE](LICENSE)。
+
+*Disclaimer: AI-generated, provided "as is" without warranty. The bot can run console commands and send messages on your server, may incur API costs, and sends server/player data to the AI providers you configure. Test on a non-production server, keep backups, and comply with the Minecraft EULA, provider terms and privacy law. Not affiliated with Mojang, Microsoft, NeoForged or any AI provider.*
